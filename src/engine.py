@@ -4,13 +4,24 @@ import torch.nn as nn
 
 
 def train_one_epoch(model, loader, criterion, optimizer, device):
+    """Roda uma época de treino e retorna a norma L2 do gradiente de cada batch
+    (medida logo após backward, antes do step -- diagnostica vanishing/exploding gradients)."""
     model.train()
+    grad_norms = []
     for X_batch, y_batch in loader:
         X_batch, y_batch = X_batch.to(device), y_batch.to(device)
         optimizer.zero_grad()
         loss = criterion(model(X_batch), y_batch)
         loss.backward()
+
+        grad_norm = sum(
+            p.grad.detach().norm(2).item() ** 2
+            for p in model.parameters() if p.grad is not None
+        ) ** 0.5
+        grad_norms.append(grad_norm)
+
         optimizer.step()
+    return grad_norms
 
 
 @torch.no_grad()
@@ -29,17 +40,18 @@ def fit(model, train_loader, val_loader, epochs, lr, device):
     criterion = nn.BCEWithLogitsLoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
-    history = {"train_loss": [], "val_loss": []}
+    history = {"train_loss": [], "val_loss": [], "grad_norm": []}
     best_val_loss = float("inf")
     best_state = None
 
     for _ in range(epochs):
-        train_one_epoch(model, train_loader, criterion, optimizer, device)
+        epoch_grad_norms = train_one_epoch(model, train_loader, criterion, optimizer, device)
         train_loss = evaluate_loss(model, train_loader, criterion, device)
         val_loss = evaluate_loss(model, val_loader, criterion, device)
 
         history["train_loss"].append(train_loss)
         history["val_loss"].append(val_loss)
+        history["grad_norm"].append(float(np.mean(epoch_grad_norms)))
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
