@@ -1,52 +1,29 @@
 import matplotlib.pyplot as plt
-import numpy as np
 import seaborn as sns
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
-
-from sklearn.datasets import load_breast_cancer
-from sklearn.metrics import (
-    accuracy_score,
-    confusion_matrix,
-    f1_score,
-    precision_score,
-    recall_score,
-    roc_auc_score,
-    roc_curve,
-)
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import StandardScaler
-
+from sklearn.metrics import roc_curve
 import optuna
-
+from src.data import load_breast_cancer_splits
+from src.engine import fit, predict_probs
+from src.metrics import classification_report_dict
 from src.model import BreastCancerMLP
 from src.utils import BreastCancerDataset, set_seed
 
 set_seed(42)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# Carregar dataset
-data = load_breast_cancer()
-X_raw, y_raw = data.data, data.target
-print(f"📊 Dimensão do dataset: {X_raw.shape}")
-print(f"Classes: {list(data.target_names)}")
+# Carregar e dividir dataset (treino 70% / validação 15% / teste 15%, padronizado no treino)
+splits = load_breast_cancer_splits(seed=42)
+X_train, y_train = splits["X_train"], splits["y_train"]
+X_val, y_val = splits["X_val"], splits["y_val"]
+X_test, y_test = splits["X_test"], splits["y_test"]
+target_names = splits["target_names"]
 
-# 2. Divisão Estratificada: Treino (70%), Validação (15%), Teste (15%)
-X_train_raw, X_temp_raw, y_train, y_temp = train_test_split(
-    X_raw, y_raw, test_size=0.30, random_state=42, stratify=y_raw
-)
-X_val_raw, X_test_raw, y_val, y_test = train_test_split(
-    X_temp_raw, y_temp, test_size=0.50, random_state=42, stratify=y_temp
-)
-
-# 3. Padronização de Atributos (ajuste EXCLUSIVO no conjunto de Treino)
-scaler = StandardScaler()
-X_train = scaler.fit_transform(X_train_raw)
-X_val = scaler.transform(X_val_raw)
-X_test = scaler.transform(X_test_raw)
-
+print(f"📊 Dimensão do dataset: {X_train.shape[0] + X_val.shape[0] + X_test.shape[0], X_train.shape[1]}")
+print(f"Classes: {list(target_names)}")
 print(f"✅ Formato X_train: {X_train.shape} | X_val: {X_val.shape} | X_test: {X_test.shape}")
 
 def objective(trial):
@@ -163,56 +140,24 @@ batch_size = best_p['batch_size']
 
 set_seed(42)
 final_model = BreastCancerMLP(X_train.shape[1], hidden_dims, act_cls, norm_type, dropout_rate).to(device)
-criterion = nn.BCEWithLogitsLoss()
-optimizer = optim.Adam(final_model.parameters(), lr=lr)
 
 train_loader_final = DataLoader(BreastCancerDataset(X_train, y_train), batch_size=batch_size, shuffle=True)
+val_loader_final = DataLoader(BreastCancerDataset(X_val, y_val), batch_size=batch_size, shuffle=False)
 test_loader_final = DataLoader(BreastCancerDataset(X_test, y_test), batch_size=batch_size, shuffle=False)
 
 # Treinamento Completo
 print("🏋️ Treinando modelo definitivo...")
-for epoch in range(1, 51):
-    final_model.train()
-    for X_batch, y_batch in train_loader_final:
-        X_batch, y_batch = X_batch.to(device), y_batch.to(device)
-        optimizer.zero_grad()
-        out = final_model(X_batch)
-        loss = criterion(out, y_batch)
-        loss.backward()
-        optimizer.step()
+_, best_state = fit(final_model, train_loader_final, val_loader_final, epochs=50, lr=lr, device=device)
+final_model.load_state_dict(best_state)
+torch.save(best_state, "checkpoints/hyperparameter_tuning_best_model.pt")
 
 # Avaliação no Teste
-final_model.eval()
-y_probs = []
-with torch.no_grad():
-    for X_batch, _ in test_loader_final:
-        X_batch = X_batch.to(device)
-        logits = final_model(X_batch).cpu().numpy()
-        y_probs.extend((1 / (1 + np.exp(-logits))).flatten())
-
-# No exemplo da aula (Insurance, regressão) a saida do modelo ja era a previsao final,
-# usada direto. Aqui a saida e logit de classificacao (BCEWithLogitsLoss nao aplica
-# sigmoid internamente, por estabilidade numerica) -- por isso e preciso aplicar sigmoid
-# manualmente pra virar probabilidade, e so entao arredondar num limiar (0.5) pra
-# decidir a classe (0=maligno, 1=benigno). Passo que nao existe em regressao.
-y_probs = np.array(y_probs)
-y_pred = (y_probs >= 0.5).astype(int)
-
-# Cálculo de Métricas Finais de Classificação
-# Regressao tem 1 eixo de erro (distancia numerica) -- MAE/RMSE/R2 sao 3 jeitos de
-# resumir esse mesmo eixo. Classificacao binaria tem 2 eixos de erro (falso positivo x
-# falso negativo), que nenhuma metrica unica captura -- por isso mais metricas aqui,
-# cada uma respondendo uma pergunta diferente sobre o mesmo resultado.
-# load_breast_cancer usa label 0 = maligno, 1 = benigno. precision/recall/f1_score do
-# sklearn assumem pos_label=1 por padrao -- sem isso explicito, mediriam a classe
-# benigna, nao a maligna (a que clinicamente importa: falso negativo = cancer nao
-# detectado). Por isso pos_label=0 abaixo.
-acc = accuracy_score(y_test, y_pred)
-precision = precision_score(y_test, y_pred, pos_label=0)
-recall = recall_score(y_test, y_pred, pos_label=0)
-f1 = f1_score(y_test, y_pred, pos_label=0)
-auc = roc_auc_score(y_test, y_probs)
-cm = confusion_matrix(y_test, y_pred)
+y_probs, y_test_arr = predict_probs(final_model, test_loader_final, device)
+metrics = classification_report_dict(y_test_arr, y_probs)
+acc, precision, recall, f1, auc, cm = (
+    metrics["accuracy"], metrics["precision"], metrics["recall"],
+    metrics["f1"], metrics["roc_auc"], metrics["confusion_matrix"],
+)
 
 print("\n🎯 Métricas Finais no Conjunto de Teste:")
 print(f"   • Acurácia: {acc:.4f}")
@@ -227,7 +172,7 @@ fig, axes = plt.subplots(1, 2, figsize=(14, 5))
 # Matriz de Confusão
 sns.heatmap(
     cm, annot=True, fmt='d', cmap='Blues', ax=axes[0],
-    xticklabels=data.target_names, yticklabels=data.target_names,
+    xticklabels=target_names, yticklabels=target_names,
 )
 axes[0].set_title("Matriz de Confusão", fontsize=12, fontweight='bold')
 axes[0].set_xlabel("Previsto")
