@@ -9,3 +9,7 @@ checkpoints/*.pt
 .claude/
 .agents/
 skills-lock.json
+
+# Relatório -- arquivo de trabalho pra gerar o PDF (Claude web); conteúdo real
+# já fica na célula final do notebook, que vai pro git
+RELATORIO.md
